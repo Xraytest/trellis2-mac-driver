@@ -95,6 +95,12 @@ def parse_args():
                     help="覆盖 VAE 精度（默认跟 --dtype）")
     ap.add_argument("--dino-dtype", default=None, choices=["fp32", "bf16", "fp16"],
                     help="覆盖 DINO 精度（默认跟 --dtype）")
+    ap.add_argument("--attention", default="split",
+                    choices=["split", "sub_quad", "pytorch", "default"],
+                    help="注意力实现。split=分块（fp32 友好）；pytorch=SDPA（MPS 4096token OOM）")
+    ap.add_argument("--struct-attention", default=None,
+                    choices=["split", "sub_quad", "pytorch"],
+                    help="仅结构阶段覆盖注意力实现（该阶段 4096 token 是内存大头）")
     ap.add_argument("--comfy", default=os.path.expanduser("~/ComfyUI"))
     ap.add_argument("--steps-s", type=int, default=12, help="结构阶段步数")
     ap.add_argument("--steps-h", type=int, default=20, help="shape 阶段步数")
@@ -191,18 +197,31 @@ def free_cache(device):
         pass
 
 
-def force_sdpa_attention():
-    """强制 comfy 注意力走 attention_pytorch（SDPA 融合核）。
+def force_attention_mode(mode, t2m=None):
+    """强制 comfy 注意力实现。t2m 不为 None 时同时改 trellis2.model 的调用点绑定
+    （model.py 在 import 时按值把 optimized_attention 绑进自己命名空间，运行时改
+    t2m.optimized_attention 即可生效，因此支持 per-stage 切换）。
 
-    默认选择（无 sage/flash/xformers、pytorch_attention 未开）会落到
-    attention_sub_quad：fp32 + 4096 token 下把 MPS 16GB 打爆（实测 OOM）。
-    必须在 import comfy.ldm.trellis2.model 之前打补丁——trellis2.model 在
-    import 时按值绑定 optimized_attention，后改无效。
+    MPS 实测（2026-11-04, 16GB）：
+      * SDPA（pytorch）对 4096-token 稠密注意力回落 math 路径，整块 score
+        矩阵（bf16 [2,12,4096,4096] = 768MB/层）直接实例化 → OOM
+      * sub_quad 分块（ComfyUI 默认）bf16 可跑，但 fp32 仍爆
+      * split 分块对 fp32 最友好（q 分块逐段算 scores，瞬态 ~200MB 级）
     """
     import comfy.ldm.modules.attention as comfy_attn
-    comfy_attn.optimized_attention = comfy_attn.attention_pytorch
-    comfy_attn.optimized_attention_masked = comfy_attn.attention_pytorch
-    log("  attention: forced SDPA (attention_pytorch)")
+    fn = {"split": comfy_attn.attention_split,
+          "sub_quad": comfy_attn.attention_sub_quad,
+          "pytorch": comfy_attn.attention_pytorch}.get(mode)
+    if fn is None:
+        log("  attention: 保持 comfy 默认选择")
+        return fn
+    comfy_attn.optimized_attention = fn
+    comfy_attn.optimized_attention_masked = fn
+    if t2m is not None:
+        t2m.optimized_attention = fn
+        t2m.optimized_attention_masked = fn
+    log("  attention: forced %s" % mode)
+    return fn
 
 
 # ---------------------------------------------------------------- DINO 条件
@@ -373,9 +392,16 @@ def main():
     import comfy.ops  # noqa: E402
     import comfy.utils  # noqa: E402
     import comfy.latent_formats  # noqa: E402
-    force_sdpa_attention()  # 必须在 import trellis2.model 之前
     import comfy.ldm.trellis2.model as t2m  # noqa: E402
     import comfy.ldm.trellis2.vae as t2v  # noqa: E402
+
+    attn_fn = force_attention_mode(args.attention, t2m)
+    struct_attn_fn = None
+    if args.struct_attention and args.struct_attention != args.attention:
+        import comfy.ldm.modules.attention as comfy_attn
+        struct_attn_fn = {"split": comfy_attn.attention_split,
+                          "sub_quad": comfy_attn.attention_sub_quad,
+                          "pytorch": comfy_attn.attention_pytorch}[args.struct_attention]
 
     ops = comfy.ops.disable_weight_init  # fp32 权重 + fp32 计算 -> 纯 torch 模块
     model_bf16 = os.path.join(comfy_dir, "models", "diffusion_models", "trellis_2_bf16.safetensors")
@@ -437,9 +463,16 @@ def main():
         return torch.nn.functional.pad(out.float(), (0, 0, 0, 0, 0, 0, 0, 24))
 
     # ---- [3/6] 结构采样
+    if struct_attn_fn is not None:
+        t2m.optimized_attention = struct_attn_fn
+        t2m.optimized_attention_masked = struct_attn_fn
+        log("  struct attention: %s" % args.struct_attention)
     log("[3/6] structure 采样…")
     x_struct = sample_stage(struct_fn, noise_s, sigmas_s, cond_s, zeros_s, "struct",
                             cfg_scale, rescale, multiplier, step_cache_device=DEV_STRUCT)
+    if struct_attn_fn is not None:
+        t2m.optimized_attention = attn_fn
+        t2m.optimized_attention_masked = attn_fn
     log("[3/6] structure 完成 %.1fs latent_std=%.4f"
         % (time.time() - t0, float(x_struct.float().std())))
     dump_save({"x_struct": x_struct[:1, :8].float().cpu(), "sigmas": sigmas_s}, "struct.pt")
