@@ -36,9 +36,8 @@ if ! curl -s --max-time 4 http://127.0.0.1:8188/system_stats >/dev/null 2>&1; th
 fi
 
 echo "== [2/3] 产裁切图 =="
-$PY "$DIR/crop_redbrick.py" || { echo "FATAL: 裁切失败"; exit 1; }
-CROP="$BASE/output/drv/crop_red_brick_00001_.png"
-[ -f "$CROP" ] || { echo "FATAL: 找不到 $CROP"; exit 1; }
+CROP=$($PY "$DIR/crop_redbrick.py" | grep -E '^CROP_PATH=' | head -1 | cut -d= -f2-)
+[ -n "$CROP" ] && [ -f "$CROP" ] || { echo "FATAL: 裁切图未产出"; exit 1; }
 ls -l "$CROP"
 
 echo "== [3/3] 释放内存 + 驱动全流程 =="
