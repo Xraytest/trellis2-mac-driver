@@ -55,6 +55,7 @@ $PY "$DIR/trellis2_mac_driver.py" \
   --out "$OUT/red_brick_${DTYPE}.glb" \
   --device mps --dtype "$DTYPE" --seed "$SEED" \
   --struct-dtype bf16 --struct-attention sub_quad \
+  --tex-dtype bf16 --tex-size 1024 \
   --vae-device cpu \
   --dump "$OUT/dump" \
   "$@" 2>&1 | tee "$OUT/driver.log"
