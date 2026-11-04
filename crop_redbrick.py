@@ -88,7 +88,18 @@ def main():
             e = h[pid]
             st = e.get("status", {})
             if st.get("completed"):
-                print("DONE", json.dumps(e.get("outputs", {}).get("50", {}).get("images", [])))
+                imgs = e.get("outputs", {}).get("50", {}).get("images", [])
+                print("DONE", json.dumps(imgs))
+                if imgs:
+                    sub = imgs[0].get("subfolder", "")
+                    name = imgs[0].get("filename", "")
+                    out_root = os.environ.get("COMFYUI_OUTPUT_DIR",
+                                              os.path.expanduser("~/ComfyUI/output"))
+                    path = os.path.join(out_root, sub, name)
+                    if os.path.isfile(path):
+                        print("CROP_PATH=" + path)
+                    else:
+                        print("CROP_PATH_MISSING=" + path)
                 return
             if st.get("status_str") == "error":
                 raise SystemExit("ERROR " + json.dumps(e)[:1500])
