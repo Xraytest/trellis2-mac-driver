@@ -292,7 +292,8 @@ def sample_stage(model_fn, x, sigmas, cond, zeros_cond, tag, cfg_scale, rescale,
         sig_next = float(sigmas[i + 1])
         t_vec = torch.full((2,), sig * multiplier, dtype=torch.float32, device=cond.device)
         x_in = torch.cat([x, x], dim=0)
-        v_c, v_u = model_fn(x_in, t_vec, torch.cat([cond, zeros_cond], dim=0))
+        with torch.inference_mode():
+            v_c, v_u = model_fn(x_in, t_vec, torch.cat([cond, zeros_cond], dim=0))
         v_c = v_c.float()
         v_u = v_u.float()
         x0_c = x_in[:1] - v_c * sig
