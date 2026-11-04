@@ -86,6 +86,15 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--device", default="mps", choices=["mps", "cuda", "cpu"])
     ap.add_argument("--dtype", default="fp32", choices=["fp32", "bf16", "fp16"])
+    ap.add_argument("--struct-dtype", default=None, choices=["fp32", "bf16", "fp16"],
+                    help="覆盖结构 DiT 精度（默认跟 --dtype）。结构阶段 4096 token 稠密注意力，"
+                         "fp32 在 16GB MPS 会 OOM；bf16 为 ComfyUI 同档位")
+    ap.add_argument("--shape-dtype", default=None, choices=["fp32", "bf16", "fp16"],
+                    help="覆盖 shape DiT 精度（默认跟 --dtype）")
+    ap.add_argument("--vae-dtype", default=None, choices=["fp32", "bf16", "fp16"],
+                    help="覆盖 VAE 精度（默认跟 --dtype）")
+    ap.add_argument("--dino-dtype", default=None, choices=["fp32", "bf16", "fp16"],
+                    help="覆盖 DINO 精度（默认跟 --dtype）")
     ap.add_argument("--comfy", default=os.path.expanduser("~/ComfyUI"))
     ap.add_argument("--steps-s", type=int, default=12, help="结构阶段步数")
     ap.add_argument("--steps-h", type=int, default=20, help="shape 阶段步数")
@@ -342,7 +351,15 @@ def export_glb(out_path, vertices, triangles, open_fn):
 # ---------------------------------------------------------------- 主流程
 def main():
     args = parse_args()
-    dt = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
+
+    def stage_dt(name):
+        raw = getattr(args, name) or args.dtype
+        return {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[raw]
+
+    DT_S = stage_dt("struct_dtype")    # 结构 DiT
+    DT_H = stage_dt("shape_dtype")     # shape DiT
+    DT_V = stage_dt("vae_dtype")       # VAE
+    DT_D = stage_dt("dino_dtype")      # DINO
     dev = torch.device(args.device)
     DEV_STRUCT = torch.device(args.struct_device or args.device)
     DEV_SHAPE = torch.device(args.shape_device or args.device)
@@ -372,9 +389,10 @@ def main():
     multiplier = 1000.0
 
     log("== TRELLIS.2 自构建驱动 ==")
-    log("device=%s dtype=%s seed=%d steps=%d/%d cfg=%.2f rescale=%.2f shift=%.1f"
-        % (args.device, args.dtype, args.seed, args.steps_s, args.steps_h,
-           cfg_scale, rescale, shift))
+    log("device=%s dtype=%s struct=%s shape=%s vae=%s dino=%s seed=%d steps=%d/%d "
+        "cfg=%.2f rescale=%.2f shift=%.1f"
+        % (args.device, args.dtype, DT_S, DT_H, DT_V, DT_D, args.seed,
+           args.steps_s, args.steps_h, cfg_scale, rescale, shift))
 
     if args.dump:
         os.makedirs(args.dump, exist_ok=True)
@@ -386,7 +404,7 @@ def main():
 
     # ---- [1/6] DINO 条件
     t0 = time.time()
-    cond = encode_dino(args.image, comfy_dir, dino_ckpt, DEV_DINO, dt, ops).to(dev)
+    cond = encode_dino(args.image, comfy_dir, dino_ckpt, DEV_DINO, DT_D, ops).to(dev)
     zeros_cond = torch.zeros_like(cond)
     log("[1/6] dino cond %.1fs" % (time.time() - t0))
     dump_save({"cond_tokens": cond.cpu()}, "cond.pt")
@@ -394,12 +412,12 @@ def main():
     # ---- [2/6] 结构 DiT 加载
     t0 = time.time()
     log("[2/6] structure DiT 加载…")
-    sd = load_prefixed(model_bf16, "model.structure_model.", dt)
+    sd = load_prefixed(model_bf16, "model.structure_model.", DT_S)
     struct_model = t2m.SparseStructureFlowModel(
         resolution=16, in_channels=8, out_channels=8, model_channels=1536,
         cond_channels=1024, num_blocks=30, num_heads=12, mlp_ratio=5.3334,
         share_mod=True, qk_rms_norm=True, qk_rms_norm_cross=True,
-        operations=ops, device=DEV_STRUCT, dtype=dt,
+        operations=ops, device=DEV_STRUCT, dtype=DT_S,
     )
     struct_model.load_state_dict(sd, strict=True)
     struct_model.eval().to(DEV_STRUCT)
@@ -413,8 +431,8 @@ def main():
     zeros_s = torch.zeros_like(cond_s)
 
     def struct_fn(x_in, t_vec, c2):
-        x8 = x_in[:, :8].to(dt)
-        out = struct_model(x8, t_vec.to(dt), c2.to(dt))
+        x8 = x_in[:, :8].to(DT_S)
+        out = struct_model(x8, t_vec.to(DT_S), c2.to(DT_S))
         # Trellis2 wrapper：8ch 输出 pad 回 32ch（sampler 在 32ch 空间做 euler）
         return torch.nn.functional.pad(out.float(), (0, 0, 0, 0, 0, 0, 0, 24))
 
@@ -433,13 +451,13 @@ def main():
     t0 = time.time()
     log("[4/6] 结构 VAE 解码…")
     vae_sd = comfy.utils.load_torch_file(shape_vae_path)
-    shape_vae = t2v.ShapeVae().to(dtype=dt)
+    shape_vae = t2v.ShapeVae().to(dtype=DT_V)
     shape_vae.load_state_dict(vae_sd, strict=True)
     shape_vae.eval().to(DEV_VAE)
     del vae_sd
     free_cache(DEV_VAE)
 
-    x8 = x_struct[:1, :8].to(DEV_VAE).to(dt)
+    x8 = x_struct[:1, :8].to(DEV_VAE).to(DT_V)
     with torch.no_grad():
         decoded = shape_vae.decode_structure(x8) > 0              # [1,1,64,64,64]
     decoded = torch.nn.functional.max_pool3d(decoded.float(), 2, 2, 0) > 0.5  # -> 32³
@@ -456,13 +474,13 @@ def main():
     # ---- [5/6] shape DiT 采样
     t0 = time.time()
     log("[5/6] shape DiT (img2shape_512) 加载…")
-    sd = load_prefixed(model_bf16, "model.img2shape_512.", dt)
+    sd = load_prefixed(model_bf16, "model.img2shape_512.", DT_H)
     slat_model = t2m.SLatFlowModel(
         resolution=32, in_channels=32, out_channels=32, model_channels=1536,
         cond_channels=1024, num_blocks=30, num_heads=12, mlp_ratio=5.3334,
         share_mod=True, qk_rms_norm=True, qk_rms_norm_cross=True,
         image_attn_mode="global",
-        operations=ops, device=DEV_SHAPE, dtype=dt,
+        operations=ops, device=DEV_SHAPE, dtype=DT_H,
     )
     slat_model.load_state_dict(sd, strict=True)
     slat_model.eval().to(DEV_SHAPE)
@@ -479,13 +497,13 @@ def main():
             < counts.to(DEV_SHAPE).unsqueeze(1))
 
     def shape_fn(x_in, t_vec, c2):
-        xb = x_in.squeeze(-1).transpose(1, 2).to(dt)          # [2, mt, 32]
+        xb = x_in.squeeze(-1).transpose(1, 2).to(DT_H)      # [2, mt, 32]
         feats_flat = xb[mask.expand(2, -1)]                    # [2N, 32]
         coords2 = torch.cat([coords_d, coords_d.clone()], dim=0)
         coords2[coords_d.shape[0]:, 0] += 1
         x_st = t2v.SparseTensor(feats=feats_flat, coords=coords2,
                                 shape=torch.Size([2, 32]))
-        out = slat_model(x_st, t_vec.to(dt), c2.to(dt))
+        out = slat_model(x_st, t_vec.to(DT_H), c2.to(DT_H))
         padded = torch.zeros((2, max_tokens, out.feats.shape[-1]),
                              device=DEV_SHAPE, dtype=out.feats.dtype)
         padded[mask.expand(2, -1)] = out.feats
@@ -512,7 +530,7 @@ def main():
     slat_feats = shape_slat_fmt.process_out(slat_latent.to(DEV_VAE))  # *std+mean
     coords_v = coords.to(DEV_VAE).clone()
     coords_v[:, 0] = 0
-    st = t2v.SparseTensor(feats=slat_feats.to(dt), coords=coords_v,
+    st = t2v.SparseTensor(feats=slat_feats.to(DT_V), coords=coords_v,
                           shape=torch.Size([1, 32]))
     with torch.no_grad():
         mesh, subs = shape_vae.decode_shape_slat(st, 512)
