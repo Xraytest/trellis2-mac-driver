@@ -66,10 +66,38 @@ def audit(path):
                 degenerate += sum(1 for i in range(0, n, 3)
                                   if idx[i] == idx[i+1] or idx[i+1] == idx[i+2] or idx[i] == idx[i+2])
     print("  degenerate tris:", degenerate)
+
+    # ---- 贴图 / 材质 ----
+    images = g.get("images", [])
+    textures = g.get("textures", [])
+    materials = g.get("materials", [])
+    print("  images    :", len(images))
+    print("  textures  :", len(textures))
+    print("  materials :", len(materials))
+    for mi, mat in enumerate(materials):
+        pbr = mat.get("pbrMetallicRoughness", {})
+        bct = pbr.get("baseColorTexture")
+        mrt = pbr.get("metallicRoughnessTexture")
+        print("    mat[%d] name=%r baseColorTex=%s mrTex=%s baseColorFactor=%s "
+              "metallic=%s roughness=%s"
+              % (mi, mat.get("name"), bct is not None, mrt is not None,
+                 pbr.get("baseColorFactor"), pbr.get("metallicFactor"),
+                 pbr.get("roughnessFactor")))
+    has_uv = any("TEXCOORD_0" in (prim.get("attributes") or {})
+                 for m in meshes for prim in m.get("primitives", []))
+    print("  TEXCOORD_0:", has_uv)
+    # 检查贴图数据量（bufferView 覆盖的字节）
+    img_bytes = 0
+    for im in images:
+        bv_i = im.get("bufferView")
+        if bv_i is not None:
+            img_bytes += g["bufferViews"][bv_i].get("byteLength", 0)
+    print("  image data:", img_bytes, "bytes")
+    textured = bool(images) and bool(materials) and has_uv
+    print("  textured  :", textured)
     healthy = tot_v > 1000 and tot_t > 1000 and degenerate < tot_t * 0.05
     print("  verdict   :", "HEALTHY" if healthy else "SUSPECT/BROKEN")
     return healthy
-
 
 if __name__ == "__main__":
     ok = all(audit(p) for p in sys.argv[1:])
