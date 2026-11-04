@@ -1,7 +1,7 @@
 # trellis2-mac-driver
 
-TRELLIS.2 shape 管线自构建驱动：绕开 ComfyUI 运行时的精度问题，在 applemini (M4/16GB)
-上以可控精度（默认 fp32）直接用 torch 跑通「图 → GLB」，产出正确几何。
+TRELLIS.2 完整管线自构建驱动：**形状 + 贴图 + PBR 材质**，在 applemini (M4/16GB)
+上以可控精度直接用 torch 跑通「图 → 带材质 GLB」，产出正确几何与贴图。
 
 ## 背景
 
@@ -22,17 +22,37 @@ TRELLIS.2 shape 管线自构建驱动：绕开 ComfyUI 运行时的精度问题�
 
 即：MPS 后端在 `FlexiDualGridVaeDecoder`（稀疏卷积 + `flexible_dual_grid_to_mesh`）
 上算出错误结果，与 fp32/bf16 无关。**修复 = VAE 解码放到 CPU**（`--vae-device cpu`），
-其余阶段仍走 MPS 加速。修复后 mac 产出 592,316 顶点 / 1,185,700 面，包围盒
-1.0×0.299×0.432 对齐 GPU 基线 1.0×0.277×0.438。
+其余阶段仍走 MPS 加速。
+
+### 贴图阶段同样走 CPU
+
+texture VAE 与 shape VAE 是同一类稀疏解码器，UV 展开/烘焙也一并跑 CPU
+（`--vae-device cpu` + 后处理内部强制 CPU）。因此整条贴图链路在 mac 上是确定性的，
+不受 MPS 缺陷影响。
+
+## 验收结果（mac 实跑，seed 12345，red_brick）
+
+| 项 | mac 自构建驱动 | GPU 基线（ComfyUI/CUDA） |
+|---|---|---|
+| 顶点 / 三角面 | 601,684 / **1,185,700** | 594,922 / 1,189,776 |
+| 包围盒 | 1.000 × 0.299 × 0.432 | 1.000 × 0.277 × 0.438 |
+| 退化面 | 0 | 0 |
+| 贴图 | 2 张（baseColor + metallicRoughness，1024²） | — |
+| 材质 | 1 个，baseColorTexture + metallicRoughnessTexture | — |
+| TEXCOORD_0 | 有（xatlas UV，36 charts） | — |
+| 贴图颜色 | baseColor 均值 [0.663, 0.228, 0.067]（输入砖 [0.598, 0.260, 0.181]） | — |
+| 材质通道 | G=roughness 0.998、B=metallic 0.0（红砖非金属高粗糙 ✓） | — |
+| texture 潜变量跨设备对拍 | 与 CUDA corr **0.9988**、std 一致（0.9729） | — |
 
 ## 组成
 
 | 文件 | 作用 |
 |---|---|
-| `trellis2_mac_driver.py` | 自构建驱动：DINO 条件 → 结构 DiT 采样 → 结构 VAE 解码 → shape DiT 采样 → shape VAE 解码 → GLB |
-| `crop_redbrick.py` | 经本机 ComfyUI(8188) 产 red_brick 裁切图（BiRefNet + ImageCropToMask，与 GPU 基准同配方） |
-| `run_redbrick.sh` | 一键编排：ComfyUI 裁切 → 释放内存 → caffeinate + 驱动 fp32/MPS 全流程 |
-| `audit_glb.py` | GLB 结构审计（verts/tris/bbox/退化面） |
+| `trellis2_mac_driver.py` | 主驱动：DINO → 结构 DiT → 结构 VAE → shape DiT → shape VAE → texture DiT → texture VAE → GLB |
+| `texture_stage.py` | 贴图阶段：tex 采样 / tex VAE 解码 / UV 展开 / 烘焙 / 带 PBR 材质 GLB |
+| `crop_redbrick.py` | 经本机 ComfyUI(8188) 产 red_brick 裁切图（BiRefNet + ImageCropToMask） |
+| `run_redbrick.sh` | 一键编排：裁切 → 释放内存 → caffeinate + 全链路 |
+| `audit_glb.py` | GLB 审计：verts/tris/bbox/退化面/贴图/材质/TEXCOORD |
 | `ACCESS.md` | 稳定访问通路（frp 经 ali01 直连 mac:22） |
 
 ## 用法（applemini 上）
@@ -44,12 +64,15 @@ bash run_redbrick.sh                  # fp32 全流程（VAE 自动走 CPU），
 bash run_redbrick.sh --dtype bf16     # 对照实验用
 ```
 
-`run_redbrick.sh` 的固定配方（16GB M5/M4 实测唯一可行且正确）：
+`run_redbrick.sh` 的固定配方（16GB M4 实测唯一可行且正确）：
 
 ```
 --struct-dtype bf16 --struct-attention sub_quad   # 4096 token 稠密注意力，fp32 必 OOM
 --dtype fp32 --attention split                    # shape 阶段分块注意力
+--tex-dtype bf16                                  # texture DiT（1536ch）fp32 同样塞不进
 --vae-device cpu                                  # ★ 绕开 MPS 解码缺陷（根因）
+--tex-size 1024                                   # 烘焙贴图边长
+--no-texture                                      # 只要几何时跳过贴图阶段
 ```
 
 ## 采样语义（逐条对照 comfy 0.43 源码钉死）
@@ -64,6 +87,13 @@ bash run_redbrick.sh --dtype bf16     # 对照实验用
 - shape latent `[1,32,mt,1]`（padded 行输出 0，mask 重建）
 - 结构解码：`decode_structure>0`（64³）→ `maxpool3d(2)>0.5` → argwhere coords
 - shape 解码：`process_out(·std+mean)` → `decode_shape_slat(512)` → z_up→y_up `(x,z,−y)`
+- texture 采样：`x` 与 shape 同 seed 同形状 → 同一份噪声；
+  `x_st.feats = cat([x, shape_slat], -1)`（32+32=64 通道），uncond 保留 slat 只换零条件
+- texture 解码：`Trellis2TexSLAT.process_out` → `decode_tex_slat(slat, guide_subs)`
+  `= txt_dec(...)*0.5+0.5`；6 通道 base_color/metallic/roughness/alpha；
+  coords z_up→y_up `(x,z,R−1−y)`，`R = coord_resolution*16 = 512`
+- 后处理：`UnwrapMesh`(xatlas) → `BakeTextureFromVoxel` → `ApplyTextureToMesh` →
+  `mesh_item_to_glb_bytes`，全部复用 ComfyUI 官方节点（输出与官方图完全同构）
 
 ## 精度策略
 
@@ -76,6 +106,8 @@ bash run_redbrick.sh --dtype bf16     # 对照实验用
 
 ## 已知限制
 
-- 只覆盖 shape 管线（512 档，global cross-attn 路径）；texture 阶段未包含
-- VAE 在 CPU 上解码约 13s（20 步采样合计 ~3 分钟整链）
-- 结构阶段 fp32 + 4096 token 在 16GB MPS 必 OOM，必须 `--struct-dtype bf16`
+- 单视角单图、512 档（`img2shape_512` + `shape_512`），不含 1024 cascade 上采样
+- texture 阶段只走 global cross-attn 路径（无 Pixal3D proj / NAF 分支）
+- 全链路约 7 分钟：结构 122s + shape 116s + 解码 13s + tex 采样 + 烘焙 30–40s
+- 结构/texture DiT 的 fp32 在 16GB MPS 必 OOM，必须 `--struct-dtype bf16 --tex-dtype bf16`
+- 贴图颜色是模型从单视图生成的，不是原图像素投影（红砖色偏更饱和：0.663/0.228/0.067 vs 原图 0.598/0.260/0.181）
