@@ -178,6 +178,22 @@ def free_cache(device):
         torch.cuda.empty_cache()
     elif device.type == "mps":
         torch.mps.empty_cache()
+    elif device.type == "cpu":
+        pass
+
+
+def force_sdpa_attention():
+    """强制 comfy 注意力走 attention_pytorch（SDPA 融合核）。
+
+    默认选择（无 sage/flash/xformers、pytorch_attention 未开）会落到
+    attention_sub_quad：fp32 + 4096 token 下把 MPS 16GB 打爆（实测 OOM）。
+    必须在 import comfy.ldm.trellis2.model 之前打补丁——trellis2.model 在
+    import 时按值绑定 optimized_attention，后改无效。
+    """
+    import comfy.ldm.modules.attention as comfy_attn
+    comfy_attn.optimized_attention = comfy_attn.attention_pytorch
+    comfy_attn.optimized_attention_masked = comfy_attn.attention_pytorch
+    log("  attention: forced SDPA (attention_pytorch)")
 
 
 # ---------------------------------------------------------------- DINO 条件
@@ -235,10 +251,12 @@ def flow_euler_step(x, sigma, sigma_next, x0_c, x0_u, cfg_scale, rescale):
     return x[:1] + d * (sigma_next - sigma)
 
 
-def sample_stage(model_fn, x, sigmas, cond, zeros_cond, tag, cfg_scale, rescale, multiplier):
+def sample_stage(model_fn, x, sigmas, cond, zeros_cond, tag, cfg_scale, rescale, multiplier,
+                 step_cache_device=None):
     """通用采样循环。model_fn(x2, t_vec, cond2) -> v [B,...]（v 参数化）。
 
     x: [1,...] 初始噪声。返回最终 x（latent 空间）。
+    step_cache_device 不为 None 时每步后清该设备缓存（MPS 显存碎片控制）。
     """
     steps = len(sigmas) - 1
     for i in range(steps):
@@ -253,6 +271,8 @@ def sample_stage(model_fn, x, sigmas, cond, zeros_cond, tag, cfg_scale, rescale,
         x0_u = x_in[1:] - v_u * sig
         t0 = time.time()
         x = flow_euler_step(x, sig, sig_next, x0_c, x0_u, cfg_scale, rescale)
+        if step_cache_device is not None:
+            free_cache(step_cache_device)
         log("  %s step %2d/%d sigma=%.5f x_std=%.4f (%.1fs)"
             % (tag, i + 1, steps, sig, float(x.float().std()), time.time() - t0))
     return x
@@ -336,6 +356,7 @@ def main():
     import comfy.ops  # noqa: E402
     import comfy.utils  # noqa: E402
     import comfy.latent_formats  # noqa: E402
+    force_sdpa_attention()  # 必须在 import trellis2.model 之前
     import comfy.ldm.trellis2.model as t2m  # noqa: E402
     import comfy.ldm.trellis2.vae as t2v  # noqa: E402
 
@@ -400,7 +421,7 @@ def main():
     # ---- [3/6] 结构采样
     log("[3/6] structure 采样…")
     x_struct = sample_stage(struct_fn, noise_s, sigmas_s, cond_s, zeros_s, "struct",
-                            cfg_scale, rescale, multiplier)
+                            cfg_scale, rescale, multiplier, step_cache_device=DEV_STRUCT)
     log("[3/6] structure 完成 %.1fs latent_std=%.4f"
         % (time.time() - t0, float(x_struct.float().std())))
     dump_save({"x_struct": x_struct[:1, :8].float().cpu(), "sigmas": sigmas_s}, "struct.pt")
@@ -472,7 +493,8 @@ def main():
 
     log("[5/6] shape 采样…")
     x_shape = sample_stage(shape_fn, noise_h, normal_scheduler(ms, args.steps_h),
-                           cond_h, zeros_h, "shape", cfg_scale, rescale, multiplier)
+                           cond_h, zeros_h, "shape", cfg_scale, rescale, multiplier,
+                           step_cache_device=DEV_SHAPE)
     log("[5/6] shape 完成 %.1fs" % (time.time() - t0))
 
     # 有效 token 的 latent（latent 空间原始值）
