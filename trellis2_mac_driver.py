@@ -80,6 +80,9 @@ def guarded_open(path, mode):
 
 def parse_args():
     global OUT_ROOT, DUMP_DIR, ARGS
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here not in sys.path:
+        sys.path.insert(0, _here)      # 便于 import texture_stage
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True, help="1024x1024 裁切图（ImageCropToMask 同款）")
     ap.add_argument("--out", required=True, help="输出 GLB 路径")
@@ -104,6 +107,12 @@ def parse_args():
     ap.add_argument("--comfy", default=os.path.expanduser("~/ComfyUI"))
     ap.add_argument("--steps-s", type=int, default=12, help="结构阶段步数")
     ap.add_argument("--steps-h", type=int, default=20, help="shape 阶段步数")
+    ap.add_argument("--steps-tex", type=int, default=20, help="texture 阶段步数")
+    ap.add_argument("--tex-size", type=int, default=1024, help="烘焙贴图边长")
+    ap.add_argument("--no-texture", action="store_true",
+                    help="跳过 texture 阶段，只出几何 GLB（调试用）")
+    ap.add_argument("--tex-dtype", default=None, choices=["fp32", "bf16", "fp16"],
+                    help="覆盖 texture DiT/VAE 精度（默认跟 --dtype）")
     ap.add_argument("--cfg", type=float, default=7.5)
     ap.add_argument("--rescale", type=float, default=0.7)
     ap.add_argument("--shift", type=float, default=5.0)
@@ -378,8 +387,10 @@ def main():
 
     DT_S = stage_dt("struct_dtype")    # 结构 DiT
     DT_H = stage_dt("shape_dtype")     # shape DiT
-    DT_V = stage_dt("vae_dtype")       # VAE
+    DT_V = stage_dt("vae_dtype")       # shape VAE
     DT_D = stage_dt("dino_dtype")      # DINO
+    DT_T = stage_dt("tex_dtype")       # texture DiT
+    DT_TV = DT_V                       # texture VAE 跟 shape VAE 同精度
     dev = torch.device(args.device)
     DEV_STRUCT = torch.device(args.struct_device or args.device)
     DEV_SHAPE = torch.device(args.shape_device or args.device)
@@ -558,8 +569,9 @@ def main():
     dump_save({"x_shape": slat_latent.cpu(), "n": n_coords}, "shape.pt")
     del slat_model, cond_h, zeros_h, noise_h
     free_cache(DEV_SHAPE)
-    cond = None
-    free_cache(dev)
+    if args.no_texture:
+        cond = None
+        free_cache(dev)
 
     # ---- [6/6] shape VAE 解码 -> mesh -> GLB
     t0 = time.time()
@@ -580,6 +592,68 @@ def main():
 
     size = export_glb(args.out, verts.numpy(), faces.numpy(), guarded_open)
     log("GLB 写出: %s (%d bytes)" % (args.out, size))
+
+    if not args.no_texture:
+        # ---- [7/7] texture + material
+        log("[7/7] texture 阶段：贴图 + PBR 材质…")
+        t1 = time.time()
+        import texture_stage as TS
+
+        tex_model_path = os.path.join(comfy_dir, "models", "vae",
+                                      "trellis_2_texture_vae_bf16.safetensors")
+        sd_tex = load_prefixed(model_bf16, "model.shape2txt.", DT_T)
+        txt_model = t2m.SLatFlowModel(
+            resolution=32, in_channels=64, out_channels=32, model_channels=1536,
+            cond_channels=1024, num_blocks=30, num_heads=12, mlp_ratio=5.3334,
+            share_mod=True, qk_rms_norm=True, qk_rms_norm_cross=True,
+            image_attn_mode="global",
+            operations=ops, device=DEV_SHAPE, dtype=DT_T,
+        )
+        txt_model.load_state_dict(sd_tex, strict=True)
+        txt_model.eval().to(DEV_SHAPE)
+        del sd_tex
+        free_cache(DEV_SHAPE)
+
+        cond_t = cond.to(DEV_SHAPE)
+        zeros_t = torch.zeros_like(cond_t)
+        # 必须与 DiT 权重同 dtype：torch.cat(bf16, fp32) 会提升成 fp32，
+        # 在 MPS 上触发 "Destination and Accumulator NDArray cannot have
+        # different datatype in MPSNDArrayMatrixMultiplication" 断言。
+        slat_t = slat_latent.to(DEV_SHAPE).to(DT_T)
+
+        def tex_fn(x_in, t_vec, c2):
+            xb = x_in.squeeze(-1).transpose(1, 2).to(DT_T)      # [2, mt, 32]
+            slat2 = torch.cat([slat_t, slat_t], dim=0)          # [2N, 32]
+            feats64 = torch.cat([xb[mask.expand(2, -1)], slat2], dim=-1).to(DT_T)  # [2N, 64]
+            coords2 = torch.cat([coords_d, coords_d.clone()], dim=0)
+            coords2[coords_d.shape[0]:, 0] += 1
+            x_st = t2v.SparseTensor(feats=feats64, coords=coords2,
+                                    shape=torch.Size([2, 32]))
+            out = txt_model(x_st, t_vec.to(DT_T), c2.to(DT_T))
+            padded = torch.zeros((2, max_tokens, out.feats.shape[-1]),
+                                 device=DEV_SHAPE, dtype=out.feats.dtype)
+            padded[mask.expand(2, -1)] = out.feats
+            return padded.transpose(1, 2).unsqueeze(-1).float()   # [2, 32, mt, 1]
+
+        # ComfyUI 的 texture KSampler 与 shape 用同 seed、同 latent 形状 -> 同一份噪声
+        noise_t = prepare_noise((1, 32, max_tokens, 1), args.seed).to(dev)
+        x_tex = TS.tex_sample(tex_fn, noise_t, normal_scheduler(ms, args.steps_tex),
+                              cond_t, zeros_t, multiplier)
+        tex_latent = x_tex[:1].squeeze(-1).transpose(1, 2)[0].float()[mask[0]]
+        dump_save({"x_tex": tex_latent.cpu()}, "tex.pt")
+        del txt_model, cond_t, zeros_t, noise_t, slat_t
+        free_cache(DEV_SHAPE)
+
+        tex_vae = TS.load_texture_vae(tex_model_path, DT_TV, DEV_VAE)
+        vox_coords, vox_colors, tex_res = TS.decode_tex(
+            tex_vae, tex_latent, coords, subs, 32, DT_TV, DEV_VAE)
+        del tex_vae
+        free_cache(DEV_VAE)
+
+        TS.export_textured_glb(args.out, verts, faces, vox_coords, vox_colors, tex_res,
+                               tex_size=args.tex_size, open_fn=guarded_open,
+                               unwrap_resolution=args.tex_size)
+        log("[7/7] texture 完成 %.1fs" % (time.time() - t1))
 
     if args.dump:
         import hashlib
