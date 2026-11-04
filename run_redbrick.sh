@@ -55,7 +55,7 @@ $PY "$DIR/trellis2_mac_driver.py" \
   --image "$CROP" \
   --out "$OUT/red_brick_${DTYPE}.glb" \
   --device mps --dtype "$DTYPE" --seed "$SEED" \
-  --struct-dtype bf16 \
+  --struct-dtype bf16 --struct-attention sub_quad \
   --dump "$OUT/dump" \
   "$@" 2>&1 | tee "$OUT/driver.log"
 rc=${PIPESTATUS[0]}
