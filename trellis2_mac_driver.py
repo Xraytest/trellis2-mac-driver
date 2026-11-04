@@ -292,13 +292,13 @@ def sample_stage(model_fn, x, sigmas, cond, zeros_cond, tag, cfg_scale, rescale,
         sig_next = float(sigmas[i + 1])
         t_vec = torch.full((2,), sig * multiplier, dtype=torch.float32, device=cond.device)
         x_in = torch.cat([x, x], dim=0)
+        t0 = time.time()
         with torch.inference_mode():
             v_c, v_u = model_fn(x_in, t_vec, torch.cat([cond, zeros_cond], dim=0))
         v_c = v_c.float()
         v_u = v_u.float()
         x0_c = x_in[:1] - v_c * sig
         x0_u = x_in[1:] - v_u * sig
-        t0 = time.time()
         x = flow_euler_step(x, sig, sig_next, x0_c, x0_u, cfg_scale, rescale)
         if step_cache_device is not None:
             free_cache(step_cache_device)
@@ -495,8 +495,11 @@ def main():
     with torch.no_grad():
         decoded = shape_vae.decode_structure(x8) > 0              # [1,1,64,64,64]
     decoded = torch.nn.functional.max_pool3d(decoded.float(), 2, 2, 0) > 0.5  # -> 32³
-    voxel = decoded.squeeze(1).float()
-    coords = torch.argwhere(voxel.bool())[:, [0, 2, 3, 4]].int()
+    # 对齐 ComfyUI：VaeDecodeStructureTrellis2 产 voxel.data [1,32,32,32]，
+    # Trellis2ShapeStage 在 argwhere 前 unsqueeze(1) 回 [1,1,32,32,32]（5D），
+    # 再取 [:, [0,2,3,4]] = (batch, x, y, z)。漏掉 unsqueeze 会索引错列。
+    voxel = decoded.squeeze(1).float()                            # [1,32,32,32]
+    coords = torch.argwhere(voxel.unsqueeze(1).bool())[:, [0, 2, 3, 4]].int()
     n_coords = coords.shape[0]
     log("[4/6] 结构解码 %.1fs occupancy=%d voxels (32³)" % (time.time() - t0, n_coords))
     dump_save({"coords": coords.cpu(), "voxel": voxel.cpu()}, "coords.pt")
